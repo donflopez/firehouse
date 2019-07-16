@@ -1,0 +1,21 @@
+[package]
+name = "firehouse"
+version = "0.1.0"
+authors = ["Francisco López <donflopez@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+crossbeam = "0.7.1"
+rand = "0.7.0"
+rusoto_core = "0.40.0"
+rusoto_kinesis = "0.40.0"
+serde = "1.0.94"
+serde_json = "1.0.40"
+serde_derive = "1.0.94"
+serde_yaml = "0.8"
+postgres = "0.15.2"
+r2d2 = "0.8.5"
+r2d2_postgres = "0.14.0"
+bytes = "0.4.12"
+redis = "0.11.0-beta.1"
+amiquip = "0.3.0"

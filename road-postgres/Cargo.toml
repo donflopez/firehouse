@@ -1,0 +1,16 @@
+[package]
+name = "road-postgres"
+version = "0.1.0"
+authors = ["Francisco López <donflopez@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+rayon = "1.0"
+postgres = "0.15.2"
+r2d2 = "0.8.4"
+r2d2_postgres = "0.14.0"
+serde = "1.0.92"
+serde_json = "1.0.39"
+
+[dev-dependencies]
+dockers = "0.1.5"
