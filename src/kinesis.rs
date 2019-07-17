@@ -134,7 +134,7 @@ impl KinesisHandler {
 					.shards
 					.expect("List of shards not available")
 					.clone(),
-				s!("TRIM_HORIZON"),
+				s!("LATEST"),
 			)
 		};
 
