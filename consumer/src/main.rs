@@ -1,55 +1,44 @@
-#[macro_use]
-extern crate serde_derive;
-extern crate amiquip;
-extern crate bytes;
-extern crate redis;
-extern crate reqwest;
-extern crate serde_yaml;
-
-use amiquip::{
-	Connection, ConsumerMessage, ConsumerOptions, Exchange, FieldTable, Publish,
-	QueueDeclareOptions, ExchangeType, ExchangeDeclareOptions
-};
-use rand::prelude::*;
-use redis::Commands;
-use reqwest::Client;
-use serde_json::{from_str, Value};
+use std::ops::Add;
 use std::time::Duration;
-use std::{collections::VecDeque, str, thread};
+use env_logger;
+use serde::{Serialize, Deserialize};
+use failure::{err_msg, Error};
+use futures::{Future, IntoFuture, Stream};
+// use lapin_futures as lapin;
+use lapin_futures::{Client};
+use lapin::{Error as LapErr, BasicProperties, ConnectionProperties};
+use lapin::options::{BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions, BasicQosOptions};
+use lapin::types::FieldTable;
+use log::info;
+use futures;
+use tokio;
+use tokio::runtime::Runtime;
+use rand::prelude::Rng;
 
 #[macro_use]
 mod utils;
-mod kinesis;
 
-fn get_tenant(l: &Value) -> String {
-	l["metadata"]["tenant"].to_string()
-}
 
-fn get_type(l: &Value) -> String {
-	l["metadata"]["type"].to_string()
-}
+const N_CONSUMERS : u8 = 50;
+const N_MESSAGES  : u8 = 5;
 
-fn get_sink(conf: &Value) -> String {
-	conf["sink"].to_string()
-}
-
-fn get_topic(conf: &Value, l: &Value) -> String {
-	let tenant = get_tenant(l);
-	let log_type = get_type(l);
-	let destination = get_sink(conf);
-
-	format!("all.{}.{}.{}", destination, log_type, tenant)
-}
-
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct Sink {
+	name: String,
 	url: String,
 	batch: usize,
 	interval: Duration,
 }
 
-#[derive(Deserialize, Serialize)]
+impl Sink {
+	pub fn get_name(&self) -> String {
+		self.name.clone()
+	}
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 struct Config {
+	total: usize,
 	tenant: String,
 	sinks: Vec<Sink>,
 }
@@ -61,178 +50,141 @@ impl Config {
 		let sinks: Vec<Sink> = [0..n_sinks]
 			.into_iter()
 			.map(|_| Sink {
-				url: format!("http://localhost/check/{}", tenant),
+				name: s!("post"),
+				url: format!("http://localhost:7777/check/{}", tenant),
 				batch: rand::thread_rng().gen_range(1, 1000),
-				interval: Duration::new(rand::thread_rng().gen_range(1, 300), 0),
+				interval: Duration::new(rand::thread_rng().gen_range(10, 300), 0),
 			})
 			.collect::<Vec<Sink>>();
 
-		Config { tenant, sinks }
+		Config { tenant, sinks, total: 0 }
+	}
+
+	pub fn first_sink(&self) -> &Sink {
+		self.sinks.last().unwrap()
+	}
+
+	pub fn get_batch_size(&self) -> usize {
+		self.sinks.last().unwrap().batch
+	}
+
+	pub fn get_interval_as_sec(&self) -> u64 {
+		let interval: Duration = self.sinks.last().unwrap().interval;
+		interval.as_secs()
+	}
+
+	pub fn get_general_topic(&self) -> String {
+		let tenant = self.tenant.clone();
+		let destination = self.first_sink().get_name();
+
+		format!("all.{}.*.{}", destination, tenant).replace("\"", "")
+	}
+
+	fn get_count_key(&self) -> String {
+		let tenant = self.tenant.clone();
+		let destination = self.first_sink().get_name();
+
+		format!("count_{}_{}", tenant, destination).replace("\"", "")
 	}
 }
 
-fn run_queue(
-	mut connection: Connection,
+#[derive(Deserialize, Serialize, Clone)]
+struct Job {
 	tenant: String,
-	conf: Config,
-) -> std::result::Result<Connection, amiquip::Error> {
-	let t = tenant.clone();
+	sink: Sink,
+	logs: Vec<String>
+}
 
-	let channel = connection.open_channel(Some(rand::thread_rng().gen_range(1, 50)))?;
-	channel.qos(
-		0,
-		100,
-		false,
-	)?;
-	println!("Creating thread");
-	thread::spawn(move || {
-		let mut msg_vec: Vec<String> = Vec::new();
-		let topic = format!("all.*.*.{}", t).replace("\"", "");
-
-		let exchange = channel.exchange_declare(ExchangeType::Topic, "topic_logs", ExchangeDeclareOptions::default()).unwrap();
-
-		let queue = channel
-			.queue_declare("", QueueDeclareOptions {
-				exclusive: true,
-				..QueueDeclareOptions::default()
-				})
-			.expect("Cannot declare queue");
-
-		// channel.queue_bind(queue.name(), "topic_logs", topic, FieldTable::default()).unwrap();
-		queue.bind(&exchange, topic, FieldTable::new()).unwrap();
-
-		// let consumer = channel.basic_consume(queue.name(), ConsumerOptions {
-		// 	exclusive: true,
-		// 	..ConsumerOptions::default()
-		// 	}).unwrap();
-
-		let consumer = queue.consume(ConsumerOptions::default()).unwrap();
-
-		println!("Ready to get messages");
-		loop {
-			match consumer.receiver().recv_timeout(Duration::from_secs(conf.sinks[0].interval.as_secs())) {
-				Ok(msg) => {
-					match msg {
-						ConsumerMessage::Delivery(delivery) => {
-							let client = Client::new();
-							let body: String = String::from_utf8_lossy(&delivery.body).to_string();
-
-							if msg_vec.len() == conf.sinks[0].batch - 1 {
-								msg_vec.push(body.clone());
-								println!("Sending batch for tenant {}", tenant.clone());
-								match client
-									.post(&conf.sinks[0].url.replace("\"", ""))
-									.body(msg_vec.join("\n").to_string())
-									.send()
-								{
-									Err(e) => println!("POST ERROR: {}", e),
-									_ => println!("Batch sent ok"),
-								};
-
-								msg_vec.clear();
-							} else {
-								msg_vec.push(body);
-							}
-
-							// println!("Received [{}]", body);
-							consumer.ack(delivery).unwrap();
-						}
-						other => break
-					}
-				}
-				_ => {
-					println!("Timeout reached, cleaning batch and running again! {}", msg_vec.len());
-					if msg_vec.len() > 0 {
-						let client = Client::new();
-						match client
-								.post(&conf.sinks[0].url.replace("\"", ""))
-								.body(msg_vec.join("\n").to_string())
-								.send()
-							{
-								Err(e) => println!("POST ERROR: {}", e),
-								_ => println!("Batch sent ok"),
-							};
-
-							msg_vec.clear();
-					}
-				}
-			}
+impl Job {
+	pub fn new(tenant: String, sink: Sink) -> Self {
+		Job {
+			tenant,
+			sink,
+			logs: Vec::new()
 		}
-		// for message in consumer.receiver().iter() {
-		// 	match message {
-		// 		ConsumerMessage::Delivery(delivery) => {
+	}
 
-		// 			let body: String = String::from_utf8_lossy(&delivery.body).to_string();
+	pub fn add(&mut self, log: String) {
+		self.logs.push(log);
+	}
+}
 
-		// 			if msg_vec.len() == conf.sinks[0].batch - 1 {
-		// 				msg_vec.push(body.clone());
-		// 				println!("Sending batch for tenant {}", tenant.clone());
-		// 				match client
-		// 					.post(&conf.sinks[0].url.replace("\"", ""))
-		// 					.body(msg_vec.join("\n").to_string())
-		// 					.send()
-		// 				{
-		// 					Err(e) => println!("POST ERROR: {}", e),
-		// 					_ => println!("Batch sent ok"),
-		// 				};
+// fn send_req(job: Job) -> Result {
 
-		// 				msg_vec.clear();
-		// 			} else {
-		// 				msg_vec.push(body);
-		// 			}
+// }
 
-		// 			// println!("Received [{}]", body);
-		// 			consumer.ack(delivery).unwrap();
-		// 		}
-		// 		other => {
-		// 			println!("Consumer ended: {:?}", other);
-		// 			break;
-		// 		}
-		// 	}
-		// }
-	});
+fn create_consumer(client: &Client, n: u8) -> impl Future<Item = (), Error = ()> + Send + 'static {
+    info!("will create consumer {}", n);
 
-	Ok(connection)
+    let queue = format!("jobs");
+    client.create_channel().and_then(move |channel| {
+        info!("creating queue {}", queue);
+		channel.basic_qos(50, BasicQosOptions::default())
+			.and_then(move |_| {
+        		channel.queue_declare(&queue, QueueDeclareOptions::default(), FieldTable::default()).map(move |queue| (channel, queue))
+			})
+    }).and_then(move |(channel, queue)| {
+        info!("creating consumer {}", n);
+		let req = reqwest::r#async::Client::builder()
+			.timeout(Duration::from_millis(3000))
+    		.build().expect("Reqwest client can't be built");
+        channel.basic_consume(&queue, "", BasicConsumeOptions::default(), FieldTable::default()).map(move |stream| (req, channel, stream))
+    }).and_then(move |(req, channel, stream)| {
+        info!("got stream for consumer {}", n);
+        stream.and_then(move |message| {
+			let job: Job = serde_json::from_str(std::str::from_utf8(&message.data).unwrap()).unwrap();
+
+			req.post(&job.sink.url.replace("\"", ""))
+				.body(job.logs.join("\n"))
+				.send()
+				// .map_err(|e| {
+				// 	println!("error: {}", e);
+				// 	LapErr::from(lapin::ErrorKind::UnexpectedReply)
+				// })
+				.then(move |r| {
+					match r {
+						Ok(r) => {
+							match r.status() {
+								reqwest::StatusCode::OK => Ok((true, message)),
+								_ => Ok((false, message))
+							}
+						},
+						Err(e) => {
+							info!("[{}] Error: {}", n, e);
+							Ok((false, message))
+						}
+					}
+				})
+				// .and_then(move |res| {
+				// 	// info!("Woker[{}] Message sent for tenant: {}", n, job.tenant);
+				// 	// Ok(message)
+				// })
+        }).for_each(move |(sent, message)| {
+			if sent {
+				channel.basic_ack(message.delivery_tag, false)
+			}
+			else {
+				channel.basic_nack(message.delivery_tag, false, true)
+			}
+		})
+    }).map(|_| ()).map_err(move |err| println!("got error in consumer '{}': {}", n, err))
 }
 
 fn main() {
-	let client =
-		redis::Client::open("redis://127.0.0.1:32839/").expect("Cannot open redis connection");
-	let mut con = client
-		.get_connection()
-		.expect("Cannot get redis connection");
-	let mut con2 = client
-		.get_connection()
-		.expect("Cannot get redis connection");
+    env_logger::init();
 
-	let mut redis_pubsub = con2.as_pubsub();
+    let addr = std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1:5672/%2f".into());
+    let runtime = Runtime::new().unwrap();
 
-	let mut connection = Connection::insecure_open("amqp://guest:guest@localhost:5672")
-		.expect("Cannot connect to RabbitMQ");
-
-	let t_list: String = con.get("tenant_list").expect("Not tenant_list available");
-
-	redis_pubsub.subscribe("tenant_config").unwrap();
-	let t_list_vec = t_list.split(',').into_iter().map(|s| s.to_string());
-	println!("Tenant list {:?}", t_list_vec);
-	for tenant in t_list_vec {
-		if tenant.len() > 0 {
-			println!("Adding tenant {}", tenant.clone());
-			let conf: String = con.get(tenant.clone()).unwrap();
-			let conf: Config = serde_json::from_str(&conf).unwrap();
-
-			connection = run_queue(connection, tenant.clone(), conf).unwrap();
-		}
-	}
-
-	loop {
-		let msg = redis_pubsub.get_message().unwrap();
-		let payload: String = msg.get_payload().unwrap();
-		
-		println!("Adding new tenant by subscription: {}", payload.clone());
-
-		let conf: Config = serde_json::from_str(&payload).unwrap();
-
-		connection = run_queue(connection, conf.tenant.clone(), conf).unwrap();
-	}
+    runtime.block_on_all(
+        Client::connect(&addr, ConnectionProperties::default()).map_err(Error::from).and_then(|client| {
+            let _client = client.clone();
+            futures::stream::iter_ok(0..N_CONSUMERS)
+                .for_each(move |n| tokio::spawn(create_consumer(&_client, n)))
+                .into_future()
+                .map(move |_| client)
+                .map_err(|_| err_msg("Couldn't spawn the consumer task"))
+        })
+		.map_err(|err| eprintln!("An error occured: {}", err))
+    ).expect("runtime exited with failure");
 }

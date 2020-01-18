@@ -146,10 +146,12 @@ impl KinesisHandler {
 				None => None,
 			};
 			let iterator_type = iterator_type.clone();
+			
+			// println!("Shard: {}", shard.shard_id);
 
 			thread::spawn(move || {
 				let mut it = this.get_shard_iterator(
-					shard.shard_id,
+					shard.shard_id.clone(),
 					iterator_type,
 					starting_sequence_number,
 				);
@@ -161,15 +163,17 @@ impl KinesisHandler {
 						.expect("Next shard iterator not found")
 						.clone();
 					let r_len = rec.records.len();
-
+					
+					// println!("SHARD ID: {} --- TOTAL RECORDS: {}", shard.shard_id, r_len);
+					
 					for r in rec.records {
 						s.send(r).expect("Couldn't sent the log to the channel");
 					}
 
 					if r_len == 0 {
-						thread::sleep(Duration::from_millis(2000));
+						thread::sleep(Duration::from_millis(500));
 					} else {
-						thread::sleep(Duration::from_millis(1000));
+						thread::sleep(Duration::from_millis(200));
 					}
 				}
 			});
